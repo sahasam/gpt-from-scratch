@@ -7,7 +7,7 @@ stuck. Goal: **understand transformers**, not ship a model. End target: full tra
 
 ---
 
-## Done so far — `gpt.ipynb` (Steps 1–6: data → trained bigram baseline)
+## Done so far — `bigram-model.ipynb` (Steps 1–6: data → trained bigram baseline)
 
 | Step | What | Result |
 |------|------|--------|
@@ -101,7 +101,7 @@ breaks it.
 
 ---
 
-## In progress — `attention.ipynb` (Part 2)
+## Done — `single-head-attention.ipynb` (Part 2)
 
 Setup carried over from Part 1 (imports, data, tokenizer, split, `get_batch`).
 
@@ -110,6 +110,8 @@ Setup carried over from Part 1 (imports, data, tokenizer, split, `get_batch`).
 | 7 | "Average your predecessors" trick, three equivalent ways | ✅ done |
 | 8 | Single-head self-attention (Q/K/V), toy tensors | ✅ done |
 | 9 | Wrap the head into a reusable `nn.Module` (`Head`) | ✅ done |
+| 10 | Assemble + train single-head `AttentionLM` (token+pos embed → head → logits) | ✅ ~2.44 |
+| 11 | `estimate_loss()` — stable train/val loss, averaged over `eval_iters` batches | ✅ done |
 
 **Step 7 — the mathematical trick (all three `allclose` → True):**
 1. explicit double loop (ground truth): `xbow[b,t] = x[b,:t+1].mean(dim=0)`.
@@ -164,11 +166,74 @@ the device / persists), scales affinities by `1/√head_size`, and crops the mas
 - **Blur analogy (mine):** box blur = fixed uniform kernel; attention = a content-dependent,
   causal, spatially-varying blur where each position computes its own kernel from `q·k`.
 
+**Steps 10–11 detail:**
+
+- **Step 10 — `AttentionLM` assembled + trained.** token embedding + position embedding (summed,
+  broadcast over the batch) → `Head` → `lm_head` → logits, on Part 1's `get_batch`/training/`generate`
+  ritual. Position embedding is load-bearing: attention is order-blind (`q·kᵀ` is the same however
+  you shuffle visible tokens), so without it the model can never learn sequence. `generate` crops to
+  the last `block_size` tokens — sibling of the `tril[:T,:T]` slice — so it never indexes past the
+  position table.
+- **Step 11 — `estimate_loss()`.** A single-batch loss is a noise generator (it bounced
+  `2.78 → 2.02 → 2.62`). Fix: average the loss over `eval_iters=200` batches for **both** splits,
+  under `@torch.no_grad()` (no backward graph → no wasted memory; result unchanged) and
+  `model.eval()`/`model.train()` (toggles layer *behavior* — a no-op today, a habit for when dropout
+  lands). Payoff: a clean, monotonic curve you can actually read, with `train ≈ val` throughout (too
+  small to overfit).
+
+**Bottom line:** single-head attention plateaus at **~2.44** — barely past the bigram's 2.50, even
+at 10k steps. Attention *gathers* information between positions but nothing *computes* on what's
+gathered, and one head can only track one relationship at a time. That plateau is the motivation for
+Part 3.
+
+---
+
+## Done — `multi-head-attention.ipynb` (Part 3)
+
+The finale: multi-head → feed-forward → residual + LayerNorm → transformer block → scale up.
+**A working decoder-only GPT, built one concept per step.**
+
+| Step | What | Result |
+|------|------|--------|
+| 1 | Multi-head attention (`num_heads` parallel `Head`s, concatenated) | ✅ val 2.40 |
+| 2 | Feed-forward — per-token computation on the gathered context | ✅ val 2.35 |
+| 3 | Residual connections + LayerNorm → the transformer `Block` | ✅ enables depth |
+| 4 | Stack `n_layer` blocks (`nn.Sequential`) + final LayerNorm | ✅ val 2.29 |
+| 5 | Scale up (`block_size` 8→64, `n_embd` 32→128, 4 layers) + dropout | ✅ **train 1.56 / val 1.73** |
+
+**The loss arc (bigram → GPT):** 2.50 (bigram) → 2.44 (single head) → 2.40 (4 heads) → 2.35
+(+ feed-forward) → 2.29 (3 stacked blocks) → **1.56 train / 1.73 val** (scaled, ~817K params).
+
+**The "it's alive" moment (Step 5, ~817K params, `block_size=64`):** samples finally have real
+*Shakespeare structure* — character names, colons, verse line breaks, mostly-real words:
+> BRAYCA: / How you had with manise not dlam your pains ando … / HENRY VI: / … / JULIET: / My gone?
+
+Each step's *why*, in one line:
+- **Multi-head:** one head tracks one relationship; N heads track N, concatenated so a downstream
+  layer can mix them. Fixed total width (`head_size = n_embd // num_heads`).
+- **Feed-forward:** attention only *gathers*; the per-token MLP (`n_embd → 4·n_embd → n_embd`, ReLU)
+  is the *computation*. Communication then computation — the transformer rhythm.
+- **Residuals + LayerNorm:** `x = x + sublayer(ln(x))`. The `+` is a gradient highway (makes depth
+  trainable); pre-norm LayerNorm keeps activations scaled. This is why every width stayed at `n_embd`.
+- **Stacking:** shape-preserving blocks compose — block 2's attention runs on block 1's refinements.
+- **Scale + dropout:** the architecture is *done*; reaching English is turning dials (biggest lever:
+  `block_size`/context). Dropout regularizes the now-overfitting-capable model — and is finally what
+  makes the `model.eval()` habit load-bearing.
+
+**Side experiment (mine, beyond the tutorial):** a controlled 4-vs-8 head sweep comparing *loss
+curves* (not eyeballed samples), with a double-seed trick so both runs share init origin and batch
+stream — isolating architecture from luck. Verdict: at `n_embd=32`, 8 heads ≈ 4 heads (fixed
+capacity, just partitioned thinner).
+
+## Where this lands
+
+This is exactly where Karpathy's "Let's build GPT from scratch" ends its *building*: a scaled
+decoder-only transformer (~1.48 val at full scale). What's built here is a **base model — a document
+completer, not an assistant.** The leap to ChatGPT is the *alignment* pipeline (SFT → RLHF), a whole
+second system out of scope here. Unbuilt frontiers: BPE tokenization, instruction finetuning.
+
 ## Next up
 
-- Finish Step 8 (single head), then multi-head → transformer block (residuals, LayerNorm,
-  feed-forward) → scale up. Add the √head_size scaling refinement to `wei`.
-- Assemble the full model: embedding → attention → logits, wired to Part 1's `get_batch`,
-  training loop, and `generate`.
-- `estimate_loss()` (averaged train/val) lands when we first train the attention model — the
-  point where "did we actually beat 2.5?" becomes a real question.
+- **Final exam:** rebuild the entire GPT from a blank notebook — notes open, solution notebooks
+  closed — and train to **val ~1.5** (needs the full config: `block_size=256, n_embd=384, 6 layers`,
+  ideally on a GPU/Colab). The un-handheld capstone.
